@@ -1,7 +1,10 @@
 use burn::{
     config::Config,
     module::Module,
-    nn::{conv::Conv2d, Embedding, LayerNorm},
+    nn::{
+        conv::{Conv2d, Conv2dConfig},
+        Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig,
+    },
     tensor::{backend::Backend, Device, Distribution, Tensor},
 };
 use std::f64::consts::PI;
@@ -161,8 +164,50 @@ pub struct PromptEncoder<B: Backend> {
 }
 
 impl<B: Backend> PromptEncoder<B> {
-    pub fn forward() {}
-    fn get_dense_pe(&self) -> Tensor<B, 4> {
+    pub fn forward(
+        &self,
+        // point coords BxNx2, point labels BxN
+        points: Option<(Tensor<B, 3>, Tensor<B, 2>)>,
+        // boxes Bx4
+        boxes: Option<Tensor<B, 2>>,
+        // masks Bx1xHxW
+        masks: Option<Tensor<B, 4>>,
+    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+        let bs = self.get_batch_size(points.clone(), boxes.clone(), masks.clone());
+        let sparse_embeddings = Tensor::empty([bs, 0, self.embed_dim], &self.get_device());
+        let sparse_embeddings = if let Some((coords, labels)) = points {
+            let point_embeddings = self.embed_points(coords, labels, boxes.is_none());
+            Tensor::cat(vec![sparse_embeddings, point_embeddings], 1)
+        } else {
+            sparse_embeddings
+        };
+
+        let sparse_embeddings = if let Some(boxes) = boxes {
+            let box_embeddings = self.embed_boxes(boxes);
+            Tensor::cat(vec![sparse_embeddings, box_embeddings], 1)
+        } else {
+            sparse_embeddings
+        };
+
+        let dense_embeddings = if let Some(masks) = masks {
+            self.embed_masks(masks)
+        } else {
+            self.no_mask_embed
+                .weight
+                .val()
+                .reshape([1, -1, 1, 1])
+                .expand([
+                    bs as i32,
+                    -1,
+                    self.image_embedding_size.0 as i32,
+                    self.image_embedding_size.1 as i32,
+                ])
+        };
+
+        (sparse_embeddings, dense_embeddings)
+    }
+
+    pub fn get_dense_pe(&self) -> Tensor<B, 4> {
         // 1x(embed_dim)x(embedding_h)x(embedding_w)
         self.pe_layer.forward(self.image_embedding_size).unsqueeze()
     }
@@ -207,7 +252,7 @@ impl<B: Backend> PromptEncoder<B> {
         point_embedding
     }
 
-    fn embed_boxes(&self, boxes: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn embed_boxes(&self, boxes: Tensor<B, 2>) -> Tensor<B, 3> {
         let boxes = boxes.add_scalar(0.5);
         let coords = boxes.reshape([-1, 2, 2]);
         let corner_embedding = self
@@ -245,6 +290,40 @@ impl<B: Backend> PromptEncoder<B> {
 
         corner_embedding
     }
+
+    fn embed_masks(&self, masks: Tensor<B, 4>) -> Tensor<B, 4> {
+        // doing downscalling
+        let masks = self.mask_downscalling_conv1.forward(masks);
+        let masks = self.mask_downscalling_ln1.forward(masks);
+        let masks = self.activation.forward(masks);
+        let masks = self.mask_downscalling_conv2.forward(masks);
+        let masks = self.mask_downscalling_ln2.forward(masks);
+        let masks = self.activation.forward(masks);
+        let masks = self.mask_downscalling_conv3.forward(masks);
+        masks
+    }
+
+    fn get_batch_size(
+        &self,
+        points: Option<(Tensor<B, 3>, Tensor<B, 2>)>,
+        boxes: Option<Tensor<B, 2>>,
+        masks: Option<Tensor<B, 4>>,
+    ) -> usize {
+        let batch_size = if let Some((points, _)) = points {
+            points.dims()[0]
+        } else if let Some(boxes) = boxes {
+            boxes.dims()[0]
+        } else if let Some(masks) = masks {
+            masks.dims()[0]
+        } else {
+            1
+        };
+        batch_size
+    }
+
+    fn get_device(&self) -> B::Device {
+        self.point_embedding[0].weight.device()
+    }
 }
 
 fn add_tensor_3d_and_2d<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 2>) -> Tensor<B, 3> {
@@ -252,4 +331,59 @@ fn add_tensor_3d_and_2d<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 2>) -> Tensor<
     let y = y.unsqueeze_dim::<3>(1);
     let y = y.repeat(1, x_dims[1]);
     x + y
+}
+
+#[derive(Config, Debug)]
+pub struct PromptEncoderConfig {
+    embed_dim: usize,
+    image_embedding_size: (usize, usize),
+    input_image_size: (usize, usize),
+    mask_in_channels: usize,
+}
+
+impl PromptEncoderConfig {
+    pub fn init<B: Backend>(&self, device: &Device<B>, activation: Activation) -> PromptEncoder<B> {
+        let pe_layer = PositionEmbeddingRandomConfig::new()
+            .with_num_post_feats(self.embed_dim / 2)
+            .init(device);
+
+        let num_point_embeddings = 4;
+        let point_embedding = (0..num_point_embeddings)
+            .map(|_| EmbeddingConfig::new(1, self.embed_dim).init(device))
+            .collect::<Vec<_>>();
+
+        let not_a_point_embed = EmbeddingConfig::new(1, self.embed_dim).init(device);
+
+        let mask_downscalling_conv1 = Conv2dConfig::new([1, self.mask_in_channels / 4], [2, 2])
+            .with_stride([2, 2])
+            .init(device);
+        let mask_downscalling_ln1 = LayerNormConfig::new(self.mask_in_channels / 4).init(device);
+        let mask_downscalling_conv2 =
+            Conv2dConfig::new([self.mask_in_channels / 4, self.mask_in_channels], [2, 2])
+                .with_stride([2, 2])
+                .init(device);
+        let mask_downscalling_ln2 = LayerNormConfig::new(self.mask_in_channels).init(device);
+        let mask_downscalling_conv3 =
+            Conv2dConfig::new([self.mask_in_channels, self.embed_dim], [2, 2])
+                .with_stride([2, 2])
+                .init(device);
+
+        let no_mask_embed = EmbeddingConfig::new(1, self.embed_dim).init(device);
+
+        PromptEncoder {
+            embed_dim: self.embed_dim,
+            input_image_size: self.input_image_size,
+            image_embedding_size: self.image_embedding_size,
+            pe_layer,
+            point_embedding,
+            not_a_point_embed,
+            mask_downscalling_conv1,
+            mask_downscalling_ln1,
+            mask_downscalling_conv2,
+            mask_downscalling_ln2,
+            mask_downscalling_conv3,
+            activation,
+            no_mask_embed,
+        }
+    }
 }
