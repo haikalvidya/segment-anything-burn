@@ -207,7 +207,44 @@ impl<B: Backend> PromptEncoder<B> {
         point_embedding
     }
 
-    // fn embed_boxes(&self, boxes)
+    fn embed_boxes(&self, boxes: Tensor<B, 3>) -> Tensor<B, 3> {
+        let boxes = boxes.add_scalar(0.5);
+        let coords = boxes.reshape([-1, 2, 2]);
+        let corner_embedding = self
+            .pe_layer
+            .forward_with_coords(coords, self.input_image_size);
+        let corner_embedding_dims = corner_embedding.dims();
+        let corner_embedding = corner_embedding.clone().slice_assign(
+            [
+                0..corner_embedding_dims[0],
+                0..1,
+                0..corner_embedding_dims[2],
+            ],
+            corner_embedding
+                .slice([
+                    0..corner_embedding_dims[0],
+                    0..1,
+                    0..corner_embedding_dims[2],
+                ])
+                .add(self.point_embedding[2].weight.val().unsqueeze_dim::<3>(1)),
+        );
+        let corner_embedding = corner_embedding.clone().slice_assign(
+            [
+                0..corner_embedding_dims[0],
+                1..2,
+                0..corner_embedding_dims[2],
+            ],
+            corner_embedding
+                .slice([
+                    0..corner_embedding_dims[0],
+                    1..2,
+                    0..corner_embedding_dims[2],
+                ])
+                .add(self.point_embedding[3].weight.val().unsqueeze_dim::<3>(1)),
+        );
+
+        corner_embedding
+    }
 }
 
 fn add_tensor_3d_and_2d<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 2>) -> Tensor<B, 3> {
