@@ -1,5 +1,8 @@
 use burn::{
-    config::Config, module::Module, nn::{conv::Conv2d, Embedding, LayerNorm}, tensor::{backend::Backend, Device, Tensor}
+    config::Config,
+    module::Module,
+    nn::{conv::Conv2d, Embedding, LayerNorm},
+    tensor::{backend::Backend, Device, Distribution, Tensor},
 };
 use std::f64::consts::PI;
 
@@ -14,10 +17,16 @@ impl<B: Backend> PositionEmbeddingRandom<B> {
     fn pe_encoding(&self, coords: Tensor<B, 3>) -> Tensor<B, 3> {
         // assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
         let coords = coords.mul_scalar(2.0).sub_scalar(1.0);
-        let coords = matmul_for_difference_dims_3d_with_2d(coords, self.positional_encoding_gaussian_matrix.clone());
+        let coords = matmul_for_difference_dims_3d_with_2d(
+            coords,
+            self.positional_encoding_gaussian_matrix.clone(),
+        );
         let coords = coords * (2. * PI);
         // outputs d_1 x ... x d_n x C shape
-        Tensor::cat(vec![coords.clone().sin(), coords.clone().cos()], coords.dims().len() - 1)
+        Tensor::cat(
+            vec![coords.clone().sin(), coords.clone().cos()],
+            coords.dims().len() - 1,
+        )
     }
 
     fn forward(&self, size: (usize, usize)) -> Tensor<B, 3> {
@@ -31,15 +40,31 @@ impl<B: Backend> PositionEmbeddingRandom<B> {
             .sub_scalar(0.5)
             .div_scalar(w as f64);
 
-        let stack_tensor = Tensor::<B, 2>::stack::<3>(vec![x_embed, y_embed], 3-1);
+        let stack_tensor = Tensor::<B, 2>::stack::<3>(vec![x_embed, y_embed], 3 - 1);
         self.pe_encoding(stack_tensor).permute([2, 0, 1])
     }
 
-    fn forward_with_coords(&self, coords_input: Tensor<B, 3>, image_size: (usize, usize)) -> Tensor<B, 3> {
+    fn forward_with_coords(
+        &self,
+        coords_input: Tensor<B, 3>,
+        image_size: (usize, usize),
+    ) -> Tensor<B, 3> {
         let coords = coords_input.clone();
         let coords_dims = coords.dims();
-        let coords = coords.clone().slice_assign([0..coords_dims[0], 0..coords_dims[1], 0..1], coords.clone().slice([0..coords_dims[0], 0..coords_dims[1], 0..1]).div_scalar(image_size.0 as f64));
-        let coords = coords.clone().slice_assign([0..coords_dims[0], 0..coords_dims[1], 1..2], coords.clone().slice([0..coords_dims[0], 0..coords_dims[1], 1..2]).div_scalar(image_size.1 as f64));
+        let coords = coords.clone().slice_assign(
+            [0..coords_dims[0], 0..coords_dims[1], 0..1],
+            coords
+                .clone()
+                .slice([0..coords_dims[0], 0..coords_dims[1], 0..1])
+                .div_scalar(image_size.0 as f64),
+        );
+        let coords = coords.clone().slice_assign(
+            [0..coords_dims[0], 0..coords_dims[1], 1..2],
+            coords
+                .clone()
+                .slice([0..coords_dims[0], 0..coords_dims[1], 1..2])
+                .div_scalar(image_size.1 as f64),
+        );
         self.pe_encoding(coords)
     }
 }
@@ -94,6 +119,30 @@ fn matmul_for_difference_dims_3d_with_2d<B: Backend>(
     result.reshape([x_dims[0], x_dims[1], y_dims[1]])
 }
 
+#[derive(Config, Debug)]
+struct PositionEmbeddingRandomConfig {
+    #[config(default = "64")]
+    num_post_feats: usize,
+    scale: Option<f64>,
+}
+
+impl PositionEmbeddingRandomConfig {
+    fn init<B: Backend>(&self, device: &Device<B>) -> PositionEmbeddingRandom<B> {
+        let scale = self.scale.unwrap_or(1.0);
+        let scale = if scale <= 0.0 { 1.0 } else { scale };
+        let positional_encoding_gaussian_matrix = Tensor::<B, 2>::random(
+            [2, self.num_post_feats],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let positional_encoding_gaussian_matrix =
+            positional_encoding_gaussian_matrix.mul_scalar(scale);
+        PositionEmbeddingRandom {
+            positional_encoding_gaussian_matrix,
+        }
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct PromptEncoder<B: Backend> {
     embed_dim: usize,
@@ -114,19 +163,16 @@ pub struct PromptEncoder<B: Backend> {
 impl<B: Backend> PromptEncoder<B> {
     pub fn forward() {}
     fn get_dense_pe(&self) -> Tensor<B, 4> {
+        // 1x(embed_dim)x(embedding_h)x(embedding_w)
         self.pe_layer.forward(self.image_embedding_size).unsqueeze()
     }
 
-    fn embed_points(
-        &self,
-        points: Tensor<B, 3>,
-        labels: Tensor<B, 2>,
-        pad: bool,
-    ) -> Tensor<B, 3> {
+    fn embed_points(&self, points: Tensor<B, 3>, labels: Tensor<B, 2>, pad: bool) -> Tensor<B, 3> {
         let points = points.add_scalar(0.5);
         let (points, labels) = if pad {
             let padding_point = Tensor::zeros([points.dims()[0], 1, 2], &points.device());
-            let padding_label= Tensor::ones([labels.dims()[0], 1], &labels.device()).mul_scalar(-1.0);
+            let padding_label =
+                Tensor::ones([labels.dims()[0], 1], &labels.device()).mul_scalar(-1.0);
             let points = Tensor::cat(vec![points, padding_point], 1);
             let labels = Tensor::cat(vec![labels, padding_label], 1);
             (points, labels)
@@ -134,8 +180,39 @@ impl<B: Backend> PromptEncoder<B> {
             (points, labels)
         };
 
-        let point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size);
+        let point_embedding = self
+            .pe_layer
+            .forward_with_coords(points, self.input_image_size);
+        let labels_bool = labels.clone().equal_elem(-1).unsqueeze_dim::<3>(2);
+        let point_embedding = point_embedding.mask_fill(labels_bool.clone(), 0);
+
+        let temp_tensor =
+            add_tensor_3d_and_2d(point_embedding.clone(), self.not_a_point_embed.weight.val());
+        let point_embedding = point_embedding.mask_where(labels_bool, temp_tensor);
+
+        let labels_bool = labels.clone().equal_elem(0).unsqueeze_dim::<3>(2);
+        let temp_tensor = add_tensor_3d_and_2d(
+            point_embedding.clone(),
+            self.point_embedding[0].weight.val(),
+        );
+        let point_embedding = point_embedding.mask_where(labels_bool, temp_tensor);
+
+        let labels_bool = labels.equal_elem(1).unsqueeze_dim::<3>(2);
+        let temp_tensor = add_tensor_3d_and_2d(
+            point_embedding.clone(),
+            self.point_embedding[1].weight.val(),
+        );
+        let point_embedding = point_embedding.mask_where(labels_bool, temp_tensor);
 
         point_embedding
     }
+
+    // fn embed_boxes(&self, boxes)
+}
+
+fn add_tensor_3d_and_2d<B: Backend>(x: Tensor<B, 3>, y: Tensor<B, 2>) -> Tensor<B, 3> {
+    let x_dims = x.dims();
+    let y = y.unsqueeze_dim::<3>(1);
+    let y = y.repeat(1, x_dims[1]);
+    x + y
 }
